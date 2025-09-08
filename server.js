@@ -1,3 +1,6 @@
+// 加载环境变量配置
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -106,23 +109,7 @@ function formatTaskForMarkdown(taskData) {
         });
     }
     
-    return `
-### 任务 ${taskId} - ${taskData.title}
-**优先级**: ${taskData.priority}
-**截止时间**: ${deadline}
-**状态**: 待处理
-
-**任务描述**:
-${taskData.description}
-
-**预期结果**:
-${expected}
-
-**备注**:
-${notes}${attachmentSection}
-
----
-`;
+    return `\n### 任务 ${taskId} - ${taskData.title}\n**优先级**: ${taskData.priority}\n**截止时间**: ${deadline}\n**状态**: 待处理\n\n**任务描述**:\n${taskData.description}\n\n**预期结果**:\n${expected}\n\n**备注**:\n${notes}${attachmentSection}\n\n---\n`;
 }
 
 function validateTaskData(taskData) {
@@ -143,11 +130,11 @@ function validateTaskData(taskData) {
 
 function sanitizeInput(text) {
     if (typeof text !== 'string') return '';
-    return text.replace(/[<>"'&]/g, function(match) {
+    return text.replace(/[<>\"'&]/g, function(match) {
         const map = {
             '<': '&lt;',
             '>': '&gt;',
-            '"': '&quot;',
+            '\"': '&quot;',
             "'": '&#39;',
             '&': '&amp;'
         };
@@ -568,7 +555,7 @@ app.get('/api/files', (req, res) => {
                 originalName: originalName,
                 size: stats.size,
                 uploadTime: stats.birthtime,
-                downloadUrl: `/api/files/${filename}`
+                downloadUrl: `/uploads/${filename}`
             };
         });
         
@@ -586,17 +573,46 @@ app.get('/api/files', (req, res) => {
     }
 });
 
-// 获取智能体状态
-app.get('/api/status', (req, res) => {
+// 删除文件API
+app.delete('/api/files/:filename', (req, res) => {
     try {
-        log('获取状态请求');
+        const filename = req.params.filename;
+        const filePath = path.join(config.uploadsPath, filename);
         
-        const outboxContent = readFile(config.outboxPath);
+        // 检查文件是否存在
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({
+                success: false,
+                message: '文件不存在'
+            });
+        }
+        
+        // 删除文件
+        fs.unlinkSync(filePath);
+        
+        log(`文件删除成功: ${filename}`);
         
         res.json({
             success: true,
-            data: outboxContent,
-            message: '获取状态成功'
+            message: '文件删除成功'
+        });
+        
+    } catch (error) {
+        log(`文件删除失败: ${error.message}`);
+        res.status(500).json({
+            success: false,
+            message: '文件删除失败'
+        });
+    }
+});
+
+// 获取outbox状态
+app.get('/api/status', (req, res) => {
+    try {
+        const outboxContent = readFile(config.outboxPath);
+        res.json({
+            success: true,
+            content: outboxContent
         });
     } catch (error) {
         log(`获取状态失败: ${error.message}`);
@@ -607,61 +623,36 @@ app.get('/api/status', (req, res) => {
     }
 });
 
-// 获取inbox结构化内容
-app.get('/api/inbox-content', (req, res) => {
-    try {
-        log('获取inbox内容请求');
-        
-        const inboxContent = readFile(config.inboxPath);
-        const parsedContent = parseInboxContent(inboxContent);
-        
-        res.json({
-            success: true,
-            data: parsedContent,
-            message: '获取inbox内容成功'
-        });
-    } catch (error) {
-        log(`获取inbox内容失败: ${error.message}`);
-        res.status(500).json({
-            success: false,
-            message: '获取inbox内容失败'
-        });
-    }
-});
-
-// 获取inbox原始内容
-app.get('/api/inbox-raw', (req, res) => {
-    try {
-        log('获取inbox原始内容请求');
-        
-        const inboxContent = readFile(config.inboxPath);
-        
-        res.json({
-            success: true,
-            data: inboxContent,
-            message: '获取inbox原始内容成功'
-        });
-    } catch (error) {
-        log(`获取inbox原始内容失败: ${error.message}`);
-        res.status(500).json({
-            success: false,
-            message: '获取inbox原始内容失败'
-        });
-    }
-});
-
 // 健康检查
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        environment: process.env.NODE_ENV || 'development',
+        version: '1.0.0'
     });
 });
 
 // 错误处理中间件
 app.use((error, req, res, next) => {
     log(`服务器错误: ${error.message}`);
+    
+    if (error instanceof multer.MulterError) {
+        if (error.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({
+                success: false,
+                message: '文件大小超过限制（最大10MB）'
+            });
+        }
+        if (error.code === 'LIMIT_FILE_COUNT') {
+            return res.status(400).json({
+                success: false,
+                message: '文件数量超过限制（最多5个）'
+            });
+        }
+    }
+    
     res.status(500).json({
         success: false,
         message: '服务器内部错误'
@@ -680,49 +671,43 @@ app.use((req, res) => {
 function watchOutboxFile() {
     try {
         if (fs.existsSync(config.outboxPath)) {
-            fs.watchFile(config.outboxPath, { interval: 1000 }, (curr, prev) => {
-                if (curr.mtime !== prev.mtime) {
-                    log('检测到outbox.md文件变化');
-                    try {
-                        const content = readFile(config.outboxPath);
-                        broadcast({
-                            type: 'status-update',
-                            content: content
-                        });
-                    } catch (error) {
-                        log(`读取outbox.md失败: ${error.message}`);
-                    }
+            fs.watchFile(config.outboxPath, (curr, prev) => {
+                log('检测到outbox.md文件变化');
+                try {
+                    const content = readFile(config.outboxPath);
+                    broadcast({
+                        type: 'status-update',
+                        content: content
+                    });
+                } catch (error) {
+                    log(`读取outbox文件失败: ${error.message}`);
                 }
             });
-            log('开始监控outbox.md文件变化');
+            log(`开始监控outbox.md文件: ${config.outboxPath}`);
         } else {
-            log('outbox.md文件不存在，创建空文件');
-            writeFile(config.outboxPath, '');
-            // 递归调用以开始监控
-            setTimeout(watchOutboxFile, 1000);
+            log(`outbox.md文件不存在: ${config.outboxPath}`);
         }
     } catch (error) {
-        log(`监控文件失败: ${error.message}`);
+        log(`监控outbox文件失败: ${error.message}`);
     }
 }
 
 // 启动服务器
-const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
-server.listen(config.port, host, () => {
-    log(`服务器启动成功`);
-    log(`HTTP服务: http://${host}:${config.port}`);
-    log(`WebSocket服务: ws://${host}:${config.port}`);
-    log(`Inbox文件: ${config.inboxPath}`);
-    log(`Outbox文件: ${config.outboxPath}`);
+server.listen(config.port, () => {
+    log(`智能体任务管理系统启动成功`);
+    log(`HTTP服务: http://localhost:${config.port}`);
+    log(`WebSocket服务: ws://localhost:${config.port}`);
+    log(`Inbox文件路径: ${config.inboxPath}`);
+    log(`Outbox文件路径: ${config.outboxPath}`);
     log(`环境: ${process.env.NODE_ENV || 'development'}`);
     
-    // 开始监控文件变化
+    // 开始监控outbox文件
     watchOutboxFile();
 });
 
 // 优雅关闭
 process.on('SIGTERM', () => {
-    log('收到SIGTERM信号，正在关闭服务器...');
+    log('收到SIGTERM信号，开始优雅关闭...');
     server.close(() => {
         log('服务器已关闭');
         process.exit(0);
@@ -730,23 +715,9 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-    log('收到SIGINT信号，正在关闭服务器...');
+    log('收到SIGINT信号，开始优雅关闭...');
     server.close(() => {
         log('服务器已关闭');
         process.exit(0);
     });
 });
-
-// 未捕获异常处理
-process.on('uncaughtException', (error) => {
-    log(`未捕获异常: ${error.message}`);
-    console.error(error.stack);
-    process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    log(`未处理的Promise拒绝: ${reason}`);
-    console.error('Promise:', promise);
-});
-
-module.exports = { app, server, wss };
